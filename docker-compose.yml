@@ -1,0 +1,145 @@
+version: "3.7"
+
+services:
+  mariadb:
+    image: mariadb:10.6
+    restart: unless-stopped
+    environment:
+      MYSQL_ROOT_PASSWORD: "${MYSQL_ROOT_PASSWORD:-erpnext_root}"
+    volumes:
+      - mariadb_data:/var/lib/mysql
+
+  redis-cache:
+    image: redis:6.2-alpine
+    restart: unless-stopped
+    volumes:
+      - redis_cache_data:/data
+
+  redis-queue:
+    image: redis:6.2-alpine
+    restart: unless-stopped
+    volumes:
+      - redis_queue_data:/data
+
+  backend:
+    build: .
+    image: anagata/erpnext-full:latest
+    restart: unless-stopped
+    depends_on:
+      - mariadb
+      - redis-cache
+      - redis-queue
+    environment:
+      DB_HOST: mariadb
+      DB_PORT: "3306"
+      DB_ROOT_PASSWORD: "${MYSQL_ROOT_PASSWORD:-erpnext_root}"
+      REDIS_CACHE: redis-cache:6379
+      REDIS_QUEUE: redis-queue:6379
+      FRAPPE_SITE_NAME_HEADER: "erp.anagataitsolutions.com"
+      HTTP_PUBLISH_PORT: "8080"
+    volumes:
+      - sites:/home/frappe/frappe-bench/sites
+      - logs:/home/frappe/frappe-bench/logs
+    expose:
+      - "8000"
+      - "8080"
+
+  frontend:
+    image: anagata/erpnext-full:latest
+    restart: unless-stopped
+    command: ["nginx-entrypoint.sh"]
+    environment:
+      BACKEND: "backend:8000"
+      SOCKETIO: "websocket:9000"
+      UPSTREAM_REAL_IP_ADDRESS: "127.0.0.1"
+      UPSTREAM_REAL_IP_HEADER: "X-Forwarded-For"
+      UPSTREAM_REAL_IP_RECURSIVE: "off"
+    depends_on:
+      - backend
+      - websocket
+    volumes:
+      - sites:/home/frappe/frappe-bench/sites
+      - logs:/home/frappe/frappe-bench/logs
+    expose:
+      - "8080"
+
+  websocket:
+    image: anagata/erpnext-full:latest
+    restart: unless-stopped
+    command: ["node","/home/frappe/frappe-bench/apps/frappe/socketio.js"]
+    depends_on:
+      - backend
+    volumes:
+      - sites:/home/frappe/frappe-bench/sites
+      - logs:/home/frappe/frappe-bench/logs
+    expose:
+      - "9000"
+
+  scheduler:
+    image: anagata/erpnext-full:latest
+    restart: unless-stopped
+    command: ["bench","schedule"]
+    depends_on:
+      - backend
+    volumes:
+      - sites:/home/frappe/frappe-bench/sites
+      - logs:/home/frappe/frappe-bench/logs
+
+  worker-long:
+    image: anagata/erpnext-full:latest
+    restart: unless-stopped
+    command: ["bench","worker","--queue","long,default"]
+    depends_on:
+      - backend
+    volumes:
+      - sites:/home/frappe/frappe-bench/sites
+      - logs:/home/frappe/frappe-bench/logs
+
+  worker-short:
+    image: anagata/erpnext-full:latest
+    restart: unless-stopped
+    command: ["bench","worker","--queue","short,default"]
+    depends_on:
+      - backend
+    volumes:
+      - sites:/home/frappe/frappe-bench/sites
+      - logs:/home/frappe/frappe-bench/logs
+
+  create-site:
+    image: anagata/erpnext-full:latest
+    restart: "no"
+    entrypoint: [ "bash", "-c" ]
+    command: >
+      if [ -d "sites/erp.anagataitsolutions.com" ]; then
+        echo "Site exists - skipping create-site";
+        exit 0;
+      fi;
+      echo "Waiting for mariadb to be ready...";
+      for i in {1..60}; do
+        mysql -hmariadb -uroot -p"${MYSQL_ROOT_PASSWORD:-erpnext_root}" -e "SELECT 1" >/dev/null 2>&1 && break || sleep 2;
+      done;
+      if ! mysql -hmariadb -uroot -p"${MYSQL_ROOT_PASSWORD:-erpnext_root}" -e "SELECT 1" >/dev/null 2>&1; then
+        echo "mariadb not reachable - exiting";
+        exit 1;
+      fi;
+      bench new-site erp.anagataitsolutions.com --mariadb-root-password "${MYSQL_ROOT_PASSWORD:-erpnext_root}" --admin-password admin --mariadb-user-host-login-scope='%' --install-app erpnext;
+      # Try to install community apps if present in apps/
+      for APP in hrms india_compliance twilio_integration; do
+        if [ -d "apps/$APP" ]; then
+          echo "Installing $APP ..."
+          bench --site erp.anagataitsolutions.com install-app "$APP" || echo "install-app $APP failed"
+        fi
+      done;
+    environment:
+      MYSQL_ROOT_PASSWORD: "${MYSQL_ROOT_PASSWORD:-erpnext_root}"
+    volumes:
+      - sites:/home/frappe/frappe-bench/sites
+      - logs:/home/frappe/frappe-bench/logs
+      - ./:/home/frappe/frappe-bench   # repo (apps/ from Dockerfile will be visible)
+
+volumes:
+  mariadb_data:
+  redis_cache_data:
+  redis_queue_data:
+  sites:
+  logs:
